@@ -75,27 +75,7 @@ def discover_articles(root_dir: str) -> list:
     return articles
 
 
-def detect_export_root(articles_root: str) -> str:
-    """
-    Auto-detect the MindTouch export root by walking up from the articles root
-    directory until we find a directory that contains a 'relative/' subdirectory.
-
-    Returns:
-        The export root path, or None if not found.
-    """
-    current = os.path.abspath(articles_root)
-    while current != os.path.dirname(current):  # stop at filesystem root
-        if os.path.isdir(os.path.join(current, "relative")):
-            return current
-        # Check if we ARE inside 'relative/'
-        parent, name = os.path.split(current)
-        if name == "relative":
-            return parent
-        current = parent
-    return None
-
-
-def process_article(folder_path: str, publish: bool = False, export_root: str = None) -> dict:
+def process_article(folder_path: str, publish: bool = False) -> dict:
     """
     Process a single article folder:
       1. Transform HTML
@@ -126,14 +106,17 @@ def process_article(folder_path: str, publish: bool = False, export_root: str = 
         "article_id": None,
         "title": None,
         "images_uploaded": 0,
+        "images_missing": 0,
         "attachments_uploaded": 0,
+        "attachments_missing": 0,
         "errors": [],
+        "warnings": [],
     }
 
     try:
         # ----- Step 1: Transform HTML -----
         logger.info("Step 1: Transforming HTML...")
-        article_data = transform_article(html_path, export_root=export_root)
+        article_data = transform_article(html_path)
         result["title"] = article_data["title"]
 
         # ----- Step 2: Upload images -----
@@ -142,9 +125,13 @@ def process_article(folder_path: str, publish: bool = False, export_root: str = 
 
         for img in article_data["images"]:
             if not os.path.exists(img["local_path"]):
-                error_msg = f"Image not found: {img['local_path']}"
-                logger.error(error_msg)
-                result["errors"].append(error_msg)
+                warn_msg = f"Image not found (skipping): {img['local_path']}"
+                logger.warning(warn_msg)
+                result["warnings"].append(warn_msg)
+                result["images_missing"] += 1
+                # Use empty string so the <img> tag renders as broken image
+                # rather than causing the entire article to fail
+                url_replacements[img["placeholder"]] = ""
                 continue
 
             if config.DRY_RUN:
@@ -166,7 +153,10 @@ def process_article(folder_path: str, publish: bool = False, export_root: str = 
         for att in article_data["attachments"]:
             if not os.path.exists(att["local_path"]):
                 # Attachments may not always be in the same folder — warn but continue
-                logger.warning(f"Attachment not found (skipping): {att['local_path']}")
+                warn_msg = f"Attachment not found (skipping): {att['local_path']}"
+                logger.warning(warn_msg)
+                result["warnings"].append(warn_msg)
+                result["attachments_missing"] += 1
                 url_replacements[att["placeholder"]] = "#"
                 continue
 
@@ -219,7 +209,11 @@ def process_article(folder_path: str, publish: bool = False, export_root: str = 
             sf_client.publish_article(result["article_id"])
 
         result["status"] = "success"
-        logger.info(f"✓ Article created successfully: {result['title']}")
+        if result["warnings"]:
+            result["status"] = "success_with_warnings"
+            logger.info(f"⚠ Article created with warnings: {result['title']} ({len(result['warnings'])} missing files)")
+        else:
+            logger.info(f"✓ Article created successfully: {result['title']}")
 
     except Exception as e:
         result["status"] = "error"
@@ -239,6 +233,7 @@ def print_summary(results: list):
 
     total = len(results)
     success = sum(1 for r in results if r["status"] == "success")
+    with_warnings = sum(1 for r in results if r["status"] == "success_with_warnings")
     errors = sum(1 for r in results if r["status"] == "error")
 
     logger.info("")
@@ -246,20 +241,37 @@ def print_summary(results: list):
     logger.info(f"UPLOAD SUMMARY")
     logger.info(f"{'='*60}")
     logger.info(f"Total articles processed: {total}")
-    logger.info(f"  Successful: {success}")
-    logger.info(f"  Failed:     {errors}")
+    logger.info(f"  Successful:            {success}")
+    logger.info(f"  Success with warnings: {with_warnings}")
+    logger.info(f"  Failed:                {errors}")
     logger.info(f"{'='*60}")
 
     for r in results:
-        status_icon = "✓" if r["status"] == "success" else "✗"
+        if r["status"] == "success":
+            status_icon = "✓"
+        elif r["status"] == "success_with_warnings":
+            status_icon = "⚠"
+        else:
+            status_icon = "✗"
+
+        missing_parts = []
+        if r.get("images_missing", 0) > 0:
+            missing_parts.append(f"{r['images_missing']} imgs missing")
+        if r.get("attachments_missing", 0) > 0:
+            missing_parts.append(f"{r['attachments_missing']} att missing")
+        missing_str = f" | {', '.join(missing_parts)}" if missing_parts else ""
+
         logger.info(
             f"  {status_icon} {r['title'] or r['folder']}"
             f"  (ID: {r['article_id'] or 'N/A'})"
-            f"  [{r['images_uploaded']} imgs, {r['attachments_uploaded']} attachments]"
+            f"  [{r['images_uploaded']} imgs, {r['attachments_uploaded']} attachments{missing_str}]"
         )
         if r["errors"]:
             for err in r["errors"]:
                 logger.info(f"      ERROR: {err}")
+        if r.get("warnings"):
+            for warn in r["warnings"]:
+                logger.info(f"      WARNING: {warn}")
 
     # Save results to JSON for reference
     report_path = os.path.join(
@@ -309,11 +321,6 @@ def main():
         action="store_true",
         help="Enable debug-level logging.",
     )
-    parser.add_argument(
-        "--export-root",
-        help="Root of the MindTouch export (directory containing 'relative/'). "
-             "Auto-detected from --root if not specified.",
-    )
 
     args = parser.parse_args()
 
@@ -349,25 +356,12 @@ def main():
         logger.warning("No article folders found to process.")
         sys.exit(0)
 
-    # Detect or use the export root for resolving cross-folder file references
-    export_root = args.export_root
-    if not export_root:
-        export_root = detect_export_root(config.ARTICLES_ROOT_DIR)
-        if export_root:
-            logger.info(f"Auto-detected export root: {export_root}")
-        else:
-            logger.warning(
-                "Could not auto-detect MindTouch export root. "
-                "Cross-folder image/attachment references may not resolve. "
-                "Use --export-root to specify manually."
-            )
-
     logger.info(f"Found {len(folders)} article(s) to process.")
 
     # Process each article
     results = []
     for folder in folders:
-        result = process_article(folder, publish=config.PUBLISH_ON_CREATE, export_root=export_root)
+        result = process_article(folder, publish=config.PUBLISH_ON_CREATE)
         results.append(result)
 
     # Print summary

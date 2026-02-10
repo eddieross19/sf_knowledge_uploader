@@ -16,6 +16,7 @@ import subprocess
 import base64
 import logging
 import os
+import platform
 from simple_salesforce import Salesforce
 
 import config
@@ -24,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 # Cache the SF connection
 _sf_connection = None
+
+# Detect Windows — needed for subprocess shell handling
+IS_WINDOWS = platform.system() == "Windows"
 
 
 def get_connection() -> Salesforce:
@@ -42,7 +46,19 @@ def get_connection() -> Salesforce:
     if config.SF_CLI_TARGET_ORG:
         cmd.extend(["--target-org", config.SF_CLI_TARGET_ORG])
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # On Windows, sf is a .cmd script — subprocess needs shell=True to find it.
+    # On macOS/Linux, shell=False (default) works fine.
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=IS_WINDOWS)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "Could not find the Salesforce CLI ('sf') command.\n"
+            "Make sure it is installed and available in your PATH.\n"
+            "  Install: https://developer.salesforce.com/tools/salesforcecli\n"
+            "  Verify:  sf --version\n"
+            "On Windows, try opening a NEW terminal after installation."
+        )
+
     if result.returncode != 0:
         raise RuntimeError(
             f"Failed to get org info from SF CLI:\n{result.stderr}\n"

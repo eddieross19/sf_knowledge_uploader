@@ -32,7 +32,7 @@ import json
 from datetime import datetime
 
 import config
-from html_transformer import transform_article, replace_placeholders
+from html_transformer import transform_article, replace_placeholders, is_category_page
 import sf_client
 
 # =============================================================================
@@ -52,30 +52,88 @@ def setup_logging(log_level: str = None):
 # Core Processing Logic
 # =============================================================================
 
-def discover_articles(root_dir: str) -> list:
+def discover_articles(root_dir: str, skip_categories: bool = True) -> list:
     """
-    Scan the root directory for article subfolders.
-    Each subfolder should contain a page.html file.
+    Recursively scan for article folders containing page.html.
+
+    Walks the entire directory tree under root_dir. For each folder that
+    contains a page.html file, checks whether it's a MindTouch category
+    landing page or a real article.
+
+    Args:
+        root_dir: Root directory to scan (e.g., the 'relative/' folder
+                  inside a MindTouch export, or any subfolder within it).
+        skip_categories: If True, skip MindTouch category/guide pages that
+                         contain only DekiScript templates and no real content.
 
     Returns:
-        List of folder paths that contain a valid article.
+        Sorted list of folder paths that contain a valid article.
     """
+    logger = logging.getLogger("discover")
     articles = []
-    for entry in sorted(os.listdir(root_dir)):
-        folder_path = os.path.join(root_dir, entry)
-        if not os.path.isdir(folder_path):
+    skipped_categories = 0
+
+    root_dir = os.path.normpath(root_dir)
+
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        # Skip hidden directories and MindTouch system directories
+        dirnames[:] = [
+            d for d in sorted(dirnames)
+            if not d.startswith(".") and d != "_assets"
+        ]
+
+        if config.HTML_FILENAME not in filenames:
             continue
 
-        html_path = os.path.join(folder_path, config.HTML_FILENAME)
-        if os.path.exists(html_path):
-            articles.append(folder_path)
-        else:
-            logging.warning(f"Skipping folder (no {config.HTML_FILENAME}): {folder_path}")
+        html_path = os.path.join(dirpath, config.HTML_FILENAME)
 
+        # Optionally skip category/guide landing pages
+        if skip_categories and is_category_page(html_path):
+            logger.debug(f"Skipping category page: {dirpath}")
+            skipped_categories += 1
+            continue
+
+        articles.append(dirpath)
+
+    if skipped_categories > 0:
+        logger.info(f"Skipped {skipped_categories} category/guide landing pages.")
+
+    articles.sort()
     return articles
 
 
-def process_article(folder_path: str, publish: bool = False) -> dict:
+def detect_export_root(path: str) -> str:
+    """
+    Auto-detect the MindTouch export root directory.
+
+    Walks up from the given path looking for a directory that contains
+    'relative/' and 'hierarchy.dat' — the signature of a MindTouch export.
+
+    If the given path itself is the export root, returns it directly.
+
+    Args:
+        path: A path inside (or to) the export directory.
+
+    Returns:
+        The export root path, or None if not found.
+    """
+    path = os.path.normpath(os.path.abspath(path))
+
+    # Check the path itself and walk up
+    current = path
+    for _ in range(20):  # Safety limit on depth
+        if (os.path.isdir(os.path.join(current, "relative"))
+                and os.path.exists(os.path.join(current, "hierarchy.dat"))):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+    return None
+
+
+def process_article(folder_path: str, publish: bool = False, export_root: str = None) -> dict:
     """
     Process a single article folder:
       1. Transform HTML
@@ -88,6 +146,7 @@ def process_article(folder_path: str, publish: bool = False) -> dict:
     Args:
         folder_path: Path to the article folder.
         publish: Whether to publish the article after creation.
+        export_root: Root of the MindTouch export (for cross-folder file resolution).
 
     Returns:
         dict with processing results.
@@ -116,7 +175,7 @@ def process_article(folder_path: str, publish: bool = False) -> dict:
     try:
         # ----- Step 1: Transform HTML -----
         logger.info("Step 1: Transforming HTML...")
-        article_data = transform_article(html_path)
+        article_data = transform_article(html_path, export_root=export_root)
         result["title"] = article_data["title"]
 
         # ----- Step 2: Upload images -----
@@ -274,8 +333,9 @@ def print_summary(results: list):
                 logger.info(f"      WARNING: {warn}")
 
     # Save results to JSON for reference
+    report_dir = config.ARTICLES_ROOT_DIR or os.getcwd()
     report_path = os.path.join(
-        config.ARTICLES_ROOT_DIR or ".",
+        report_dir,
         f"upload_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     )
     try:
@@ -296,7 +356,7 @@ def main():
     )
     parser.add_argument(
         "--folder",
-        help="Process a single article folder instead of the full root directory.",
+        help="Process a single article folder instead of scanning a directory.",
     )
     parser.add_argument(
         "--dry-run",
@@ -310,7 +370,18 @@ def main():
     )
     parser.add_argument(
         "--root",
-        help="Override the ARTICLES_ROOT_DIR from config.",
+        help=(
+            "Root directory to scan for articles. Can be the export root "
+            "(auto-detects relative/ subfolder) or any subfolder within the export."
+        ),
+    )
+    parser.add_argument(
+        "--export-root",
+        help=(
+            "MindTouch export root directory (the folder containing relative/, "
+            "hierarchy.dat, and package.xml). Used to resolve cross-folder file "
+            "references. Auto-detected from --root if omitted."
+        ),
     )
     parser.add_argument(
         "--org",
@@ -320,6 +391,14 @@ def main():
         "--verbose",
         action="store_true",
         help="Enable debug-level logging.",
+    )
+    parser.add_argument(
+        "--include-categories",
+        action="store_true",
+        help=(
+            "Include MindTouch category/guide landing pages. By default these are "
+            "skipped because they contain only DekiScript templates and no real content."
+        ),
     )
 
     args = parser.parse_args()
@@ -333,6 +412,8 @@ def main():
         config.ARTICLES_ROOT_DIR = args.root
     if args.org:
         config.SF_CLI_TARGET_ORG = args.org
+    if args.include_categories:
+        config.SKIP_CATEGORY_PAGES = False
 
     setup_logging("DEBUG" if args.verbose else None)
     logger = logging.getLogger("main")
@@ -340,28 +421,82 @@ def main():
     if config.DRY_RUN:
         logger.info("*** DRY RUN MODE — No Salesforce API calls will be made ***")
 
-    # Determine which folders to process
-    if args.folder:
-        folders = [args.folder]
-    else:
-        if not config.ARTICLES_ROOT_DIR:
+    # --- Resolve export root ---
+    export_root = None
+    if args.export_root:
+        export_root = os.path.normpath(os.path.abspath(args.export_root))
+        if not os.path.isdir(os.path.join(export_root, "relative")):
             logger.error(
-                "No ARTICLES_ROOT_DIR configured and no --folder specified.\n"
-                "Set ARTICLES_ROOT_DIR in config.py or use --root <path>."
+                f"Export root does not contain a 'relative/' folder: {export_root}\n"
+                "The export root should be the top-level directory of the MindTouch export "
+                "(e.g., site_14870-export-20260205233221.155/)."
             )
             sys.exit(1)
-        folders = discover_articles(config.ARTICLES_ROOT_DIR)
+
+    # --- Determine which folders to process ---
+    if args.folder:
+        # Single folder mode
+        folder = os.path.normpath(os.path.abspath(args.folder))
+        folders = [folder]
+        # Auto-detect export root if not explicitly provided
+        if not export_root:
+            export_root = detect_export_root(folder)
+    else:
+        # Batch mode — scan a directory tree
+        scan_root = config.ARTICLES_ROOT_DIR
+        if not scan_root:
+            logger.error(
+                "No articles directory specified.\n"
+                "Use --root <path> to set the directory to scan, or --folder for a single article.\n"
+                "Examples:\n"
+                "  python main.py --root C:\\path\\to\\site_14870-export-20260205233221.155\n"
+                "  python main.py --root C:\\path\\to\\export\\relative\\Clients\\MRA_CSP\\Profiles"
+            )
+            sys.exit(1)
+
+        scan_root = os.path.normpath(os.path.abspath(scan_root))
+
+        # Auto-detect export root if not explicitly provided
+        if not export_root:
+            export_root = detect_export_root(scan_root)
+
+        # If scan_root IS the export root, scan the 'relative/' subfolder
+        if export_root and os.path.normpath(scan_root) == os.path.normpath(export_root):
+            scan_root = os.path.join(export_root, "relative")
+            logger.info(f"Export root detected — scanning: {scan_root}")
+
+        if not os.path.isdir(scan_root):
+            logger.error(f"Scan directory does not exist: {scan_root}")
+            sys.exit(1)
+
+        folders = discover_articles(
+            scan_root,
+            skip_categories=config.SKIP_CATEGORY_PAGES,
+        )
 
     if not folders:
         logger.warning("No article folders found to process.")
         sys.exit(0)
+
+    if export_root:
+        logger.info(f"Export root: {export_root}")
+    else:
+        logger.warning(
+            "Could not auto-detect MindTouch export root. Cross-folder file "
+            "references (src.path, href.path) may not resolve correctly. "
+            "Use --export-root to set it explicitly."
+        )
 
     logger.info(f"Found {len(folders)} article(s) to process.")
 
     # Process each article
     results = []
     for folder in folders:
-        result = process_article(folder, publish=config.PUBLISH_ON_CREATE)
+        result = process_article(
+            folder,
+            publish=config.PUBLISH_ON_CREATE,
+            export_root=export_root,
+        )
         results.append(result)
 
     # Print summary

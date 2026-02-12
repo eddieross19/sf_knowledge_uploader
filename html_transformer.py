@@ -90,6 +90,66 @@ def transform_article(html_path: str, export_root: str = None) -> dict:
     }
 
 
+def is_category_page(html_path: str) -> bool:
+    """
+    Quick check whether a page.html is a MindTouch category/guide landing page
+    rather than a real article.
+
+    Category pages are tagged with 'article:topic-category' or 'article:topic-guide'
+    in the <p class="template:tag-insert"> section and contain only DekiScript
+    template calls with no real content.
+
+    Args:
+        html_path: Path to the page.html file.
+
+    Returns:
+        True if the page is a category/guide page that should be skipped.
+    """
+    try:
+        with open(html_path, "r", encoding="utf-8") as f:
+            raw_html = f.read()
+    except (OSError, UnicodeDecodeError):
+        return False
+
+    soup = BeautifulSoup(raw_html, "html.parser")
+
+    # Check for category tags in the page tags section
+    tag_section = soup.find("p", class_="template:tag-insert")
+    if tag_section:
+        tag_links = tag_section.find_all("a")
+        tag_texts = [a.get_text(strip=True) for a in tag_links]
+        category_tags = {"article:topic-category", "article:topic-guide"}
+        if any(t in category_tags for t in tag_texts):
+            return True
+
+    # Also detect pages that are purely DekiScript templates with no real content.
+    # After stripping scripts and MindTouch boilerplate, if the body is effectively
+    # empty (just whitespace, tags section, and export summary), it's a category page.
+    body = soup.find("body")
+    if not body:
+        return False
+
+    # Remove known boilerplate elements to see if anything meaningful remains
+    test_soup = BeautifulSoup(str(body), "html.parser")
+    for el in test_soup.find_all("pre", class_=re.compile(r"^script")):
+        el.decompose()
+    for el in test_soup.find_all("p", class_="mt-script-comment"):
+        el.decompose()
+    for el in test_soup.find_all("p", class_="template:tag-insert"):
+        el.decompose()
+    for el in test_soup.find_all("h1", class_="mt-export-title"):
+        el.decompose()
+    for el in test_soup.find_all("hr", class_="mt-export-separator"):
+        el.decompose()
+
+    remaining_text = test_soup.get_text(strip=True)
+    # If the only remaining text is a short summary blurb or empty, it's a category page
+    if len(remaining_text) < 50:
+        return True
+
+    return False
+
+
 def _extract_title(soup: BeautifulSoup) -> str:
     """Extract article title from <h1 class='mt-export-title'> or <title>."""
     h1 = soup.find("h1", class_="mt-export-title")
@@ -104,7 +164,7 @@ def _extract_title(soup: BeautifulSoup) -> str:
 
 
 def _remove_script_blocks(soup: BeautifulSoup):
-    """Remove <pre class='script'> and <pre class='script-css'> DekiScript blocks."""
+    """Remove DekiScript blocks: <pre class='script'>, 'script-css', 'script-jem', etc."""
     for pre in soup.find_all("pre", class_=re.compile(r"^script")):
         pre.decompose()
 
@@ -151,15 +211,16 @@ def _resolve_local_path(filename: str, article_dir: str, export_root: str, mt_pa
     encoded_filename = quote(first_pass, safe="().-_")
 
     # Determine which directories to search
-    search_dirs = [article_dir]
+    search_dirs = [os.path.normpath(article_dir)]
 
     # If mt_path points to a different location, also search there
     if mt_path and export_root:
         # mt_path looks like "//Clients/EBPL/Procedures/Some_Article" or "//WebFiles/EB-PL"
         # Strip leading slashes and resolve relative to the export's 'relative/' dir
-        rel_path = mt_path.lstrip("/")
-        alt_dir = os.path.join(export_root, "relative", rel_path)
-        if alt_dir != article_dir:
+        # Replace forward slashes with os.sep for Windows compatibility
+        rel_path = mt_path.lstrip("/").replace("/", os.sep)
+        alt_dir = os.path.normpath(os.path.join(export_root, "relative", rel_path))
+        if alt_dir != search_dirs[0]:
             search_dirs.append(alt_dir)
 
     # Try each directory with both the original and encoded filename
@@ -257,9 +318,9 @@ def _process_attachments(soup: BeautifulSoup, article_dir: str, export_root: str
         if not filename:
             continue
 
-        # Check if this is an attachment type we care about
+        # Check if this is an attachment type we care about (case-insensitive)
         _, ext = os.path.splitext(filename)
-        if ext.lower() not in ATTACHMENT_EXTENSIONS:
+        if ext.lower() not in {e.lower() for e in ATTACHMENT_EXTENSIONS}:
             continue
 
         # Resolve the file path, checking URL-encoded variants and alt directories

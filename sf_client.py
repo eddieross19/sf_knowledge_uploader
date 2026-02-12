@@ -176,7 +176,9 @@ def create_article(title: str, body: str, url_name: str = None) -> dict:
         logger.info(f"  Body length: {len(body)} chars")
         return {"article_id": "DRY_RUN_ID", "title": title}
 
-    result = sf.Knowledge__kav.create(article_data)
+    # Use the configured article API name (e.g. Knowledge__kav)
+    article_sobject = getattr(sf, config.ARTICLE_API_NAME)
+    result = article_sobject.create(article_data)
     article_id = result["id"]
 
     logger.info(f"  -> Article ID: {article_id}")

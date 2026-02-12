@@ -32,9 +32,15 @@ ARTICLES_ROOT_DIR = ""  # e.g., "/Users/you/Desktop/KnowledgeArticles"
 HTML_FILENAME = "page.html"
 
 # File extensions to upload as Salesforce Files (attachments)
-ATTACHMENT_EXTENSIONS = {".oft", ".pdf", ".doc", ".docx", ".xls", ".xlsx"}
+# Matching is case-insensitive (e.g. .PDF and .pdf both match)
+ATTACHMENT_EXTENSIONS = {
+    ".oft", ".pdf", ".doc", ".docx", ".xls", ".xlsx",
+    ".pptx", ".ppt", ".msg", ".vsd", ".vsdx", ".xlsm",
+    ".csv", ".txt", ".mp4", ".docm", ".mpp",
+}
 
 # Image file extensions to process for inline embedding
+# Matching is case-insensitive (e.g. .PNG and .png both match)
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".svg"}
 
 # =============================================================================
@@ -53,3 +59,8 @@ LOG_LEVEL = "INFO"
 
 # Dry run mode — set to True to preview actions without making API calls
 DRY_RUN = False
+
+# Whether to skip MindTouch category/guide landing pages
+# (pages tagged as article:topic-category or article:topic-guide that contain
+#  only DekiScript templates and no real article content)
+SKIP_CATEGORY_PAGES = True
